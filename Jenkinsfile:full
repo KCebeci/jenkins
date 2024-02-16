@@ -1,0 +1,246 @@
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+def FULL_IMAGE_NAME = ""
+def IMAGE_TAG = ""
+def PROPS = []
+
+pipeline {
+
+  agent any
+
+  parameters {
+    booleanParam(name: 'SONAR_ANALYSIS', defaultValue: false, description: 'Sonar analizi açıp kapatmakta kullanılır. Default değeri kapalıdır.')
+    booleanParam(name: 'FORTY_ANALYSIS', defaultValue: false, description: 'Fortyfy analizi açıp kapatmakta kullanılır. Default değeri kapalıdır.')
+  }
+
+  stages {
+
+    stage('CHECKOUT') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('SET ENV') {
+      steps {
+        script {
+          def branchName = sh(returnStdout: true, script: "git name-rev --name-only HEAD").trim()
+          def commitID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:%h").trim()
+          def datetime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyMMddHHmmss"))
+
+          if (branchName.endsWith('test')) {
+            PROPS = readYaml file: "jenkins-test.yaml"
+          } else if (branchName.endsWith('dev')) {
+            PROPS = readYaml file: "jenkins-release.yaml"
+          } else if (branchName.endsWith('release')) {
+            PROPS = readYaml file: "jenkins-release.yaml"
+          } else if (branchName.endsWith('prod')) {
+            PROPS = readYaml file: "jenkins-prod.yaml"
+          } else {
+            error "Invalid branch name: ${branchName}, Supported: test,release,prod"
+          }
+
+          FULL_IMAGE_NAME = "${PROPS.DOCKER_REGISTRY_URL}/${PROPS.IMAGE_GROUP}/${PROPS.IMAGE_NAME}"
+          IMAGE_TAG = "${PROPS.BUILD_ENV}-${datetime}-${commitID}"
+
+          echo "PROPS ${PROPS}"
+          echo "BRANCH_NAME: ${branchName}"
+          echo "COMMIT_ID: ${commitID}"
+          echo "BUILD_ENV: ${PROPS.BUILD_ENV}"
+          echo "DOCKER_REGISTRY_URL: ${PROPS.DOCKER_REGISTRY_URL}"
+          echo "FULL_IMAGE_NAME: ${FULL_IMAGE_NAME}"
+          echo "IMAGE_TAG: ${IMAGE_TAG}"
+        }
+      }
+    }
+
+    stage("COMPILE CODE") {
+      agent {
+        docker {
+          image "${PROPS.DOCKER_REGISTRY_URL}/devops/maven:3.6.3-adoptopenjdk-11-openj9"
+          registryUrl "http://${PROPS.DOCKER_REGISTRY_URL}"
+          registryCredentialsId "${PROPS.DOCKER_REGISTRY_CREDENTIALS_ID}"
+        }
+      }
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId:"${PROPS.MAVEN_PUBLIC_REPO_CRED_ID}",
+            usernameVariable: 'PUBLIC_MAVEN_USR',
+            passwordVariable: 'PUBLIC_MAVEN_PSW'
+          ),
+          usernamePassword(
+            credentialsId:"${PROPS.MAVEN_STOCK_REPO_CRED_ID}",
+            usernameVariable: 'STOCK_MAVEN_USR',
+            passwordVariable: 'STOCK_MAVEN_PSW'
+          ),
+        ]) {
+          withEnv([
+            "PUBLIC_MAVEN_USR=${PUBLIC_MAVEN_USR}",
+            "PUBLIC_MAVEN_PSW=${PUBLIC_MAVEN_PSW}",
+            "STOCK_MAVEN_USR=${STOCK_MAVEN_USR}",
+            "STOCK_MAVEN_PSW=${STOCK_MAVEN_PSW}"
+          ]){
+            sh "mvn -s .mvn/settings.xml -Dmaven.test.skip=true clean package verify"
+          }
+        }
+      }
+    }
+
+    stage("SONAR ANALYSIS") {
+      agent {
+        docker {
+          image "${PROPS.DOCKER_REGISTRY_URL}/devops/maven:3.6.3-adoptopenjdk-11-openj9"
+          registryUrl "http://${PROPS.DOCKER_REGISTRY_URL}"
+          registryCredentialsId "${PROPS.DOCKER_REGISTRY_CREDENTIALS_ID}"
+        }
+      }
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId:"${PROPS.MAVEN_PUBLIC_REPO_CRED_ID}",
+            usernameVariable: 'PUBLIC_MAVEN_USR',
+            passwordVariable: 'PUBLIC_MAVEN_PSW'
+          ),
+          usernamePassword(
+            credentialsId:"${PROPS.MAVEN_STOCK_REPO_CRED_ID}",
+            usernameVariable: 'STOCK_MAVEN_USR',
+            passwordVariable: 'STOCK_MAVEN_PSW'
+          ),
+        ]) {
+          withEnv([
+            "PUBLIC_MAVEN_USR=${PUBLIC_MAVEN_USR}",
+            "PUBLIC_MAVEN_PSW=${PUBLIC_MAVEN_PSW}",
+            "STOCK_MAVEN_USR=${STOCK_MAVEN_USR}",
+            "STOCK_MAVEN_PSW=${STOCK_MAVEN_PSW}",
+            "SONAR_USER_HOME=./.sonar"
+          ]){
+            script {
+              if (params.SONAR_ANALYSIS) {
+                sh "mvn -s .mvn/settings.xml sonar:sonar -Dsonar.host.url=${PROPS.SONAR_REGISTRY_URL} -Dsonar.login=${PUBLIC_MAVEN_USR} -Dsonar.password=${PUBLIC_MAVEN_PSW} -Dsonar.projectName=${PROPS.SONAR_PROJECT_NAME}-${PROPS.IMAGE_NAME} -Dsonar.exclusions=${PROPS.SONAR_EXCLUSIONS} -f pom.xml"
+              } else {
+                echo "SONAR_ANALYSIS disabled."
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('FORTYFY ANALYSIS') {
+      steps {
+        script {
+          if (params.FORTY_ANALYSIS) {
+            build job: 'Fortyfy Job', parameters: [
+              string(name: 'micro_service', value: PROPS.IMAGE_NAME),
+              booleanParam(name: 'is_build_maven', value: true)
+            ]
+          } else {
+            echo "FORTY_ANALYSIS disabled."
+          }
+        }
+      }
+    }
+
+    stage("BUILD IMAGE") {
+      agent {
+        docker {
+          image "${PROPS.DOCKER_REGISTRY_URL}/devops/docker:19"
+          registryUrl "http://${PROPS.DOCKER_REGISTRY_URL}"
+          registryCredentialsId "${PROPS.DOCKER_REGISTRY_CREDENTIALS_ID}"
+          args '-v /var/run/docker.sock:/var/run/docker.sock'
+        }
+      }
+      environment {
+        DOCKER_CONFIG = "."
+      }
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId:"${PROPS.DOCKER_REGISTRY_CREDENTIALS_ID}",
+            usernameVariable: 'DOCKER_REGISTRY_USERNAME',
+            passwordVariable: 'DOCKER_REGISTRY_PASSWORD'
+          )
+        ]) {
+          sh "docker login -u ${DOCKER_REGISTRY_USERNAME} -p ${DOCKER_REGISTRY_PASSWORD} ${PROPS.DOCKER_REGISTRY_URL}"
+
+          sh "docker build -t ${PROPS.IMAGE_NAME}:${IMAGE_TAG} . "
+        }
+      }
+    }
+
+    stage("PUSH IMAGE") {
+      agent {
+        docker {
+          image "${PROPS.DOCKER_REGISTRY_URL}/devops/docker:19"
+          registryUrl "http://${PROPS.DOCKER_REGISTRY_URL}"
+          registryCredentialsId "${PROPS.DOCKER_REGISTRY_CREDENTIALS_ID}"
+          args '-v /var/run/docker.sock:/var/run/docker.sock'
+        }
+      }
+      environment {
+        DOCKER_CONFIG = "."
+      }
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId:"${PROPS.DOCKER_REGISTRY_CREDENTIALS_ID}",
+            usernameVariable: 'DOCKER_REGISTRY_USERNAME',
+            passwordVariable: 'DOCKER_REGISTRY_PASSWORD'
+          )
+        ]) {
+          sh "docker login -u ${DOCKER_REGISTRY_USERNAME} -p ${DOCKER_REGISTRY_PASSWORD} ${PROPS.DOCKER_REGISTRY_URL}"
+
+          sh "docker tag ${PROPS.IMAGE_NAME}:${IMAGE_TAG} ${FULL_IMAGE_NAME}:${IMAGE_TAG}"
+          sh "docker tag ${PROPS.IMAGE_NAME}:${IMAGE_TAG} ${FULL_IMAGE_NAME}:${PROPS.BUILD_ENV}-latest"
+
+          sh "docker push ${FULL_IMAGE_NAME}:${IMAGE_TAG}"
+          sh "docker push ${FULL_IMAGE_NAME}:${PROPS.BUILD_ENV}-latest"
+        }
+      }
+    }
+
+    stage("DEPLOY") {
+      agent {
+        docker {
+          image "${PROPS.DOCKER_REGISTRY_URL}/devops/quay.io/openshift/origin-cli:4.3"
+          registryUrl "http://${PROPS.DOCKER_REGISTRY_URL}"
+          registryCredentialsId "${PROPS.DOCKER_REGISTRY_CREDENTIALS_ID}"
+        }
+      }
+      environment {
+        HOME="."
+      }
+      steps {
+        script {
+          for(OC in PROPS.OPENSHIFT) {
+            withCredentials([
+              usernamePassword(
+                credentialsId:"${OC.CREDENTIALS_ID}",
+                usernameVariable: 'OC_SERVICE_ACCOUNT',
+                passwordVariable: 'OC_TOKEN'
+              )
+            ]) {
+              echo "Deploying on Datacenter: ${OC.NAME}"
+
+              sh "oc login --insecure-skip-tls-verify --token=${OC_TOKEN} --server=${OC.API_URL}"
+              sh "oc project ${OC.NAMESPACE}"
+              sh "oc set image dc/${OC.DEPLOYMENT_CONFIG} ${OC.DEPLOYMENT_CONFIG}=${FULL_IMAGE_NAME}:${IMAGE_TAG}"
+//               sh "oc rollout latest dc/${OC.DEPLOYMENT_CONFIG}"
+              sh "oc logout"
+            }
+          }
+        }
+      }
+    }
+
+  }
+  post {
+    failure {
+      mail to: 'retailcapabilityandstockmanagement.tr@vodafone.com',
+           subject: "Status: ${PROPS.IMAGE_NAME} - ${PROPS.BUILD_ENV} - ${currentBuild.result}",
+           body: "${env.BUILD_URL} has result ${currentBuild.result}"
+    }
+  }
+}
